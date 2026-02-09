@@ -3,18 +3,18 @@ import datetime
 import time
 import smtplib
 from email.mime.text import MIMEText
-from email.mime.header import Header
+from email.header import Header  # ✅ 修正了这里：去掉了错误的 .mime
 import google.generativeai as genai
 from arxiv import Search, SortCriterion
 
-# --- 1. 获取密钥 (从 GitHub Secrets) ---
+# --- 1. 获取密钥 ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 SMTP_SERVER = os.getenv("SMTP_SERVER")
 SMTP_PORT = os.getenv("SMTP_PORT")
 EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-# --- 2. 接收邮箱 (你的 MSN) ---
+# --- 2. 接收邮箱 ---
 EMAIL_RECEIVER = "julia_light@msn.cn"
 
 def setup_gemini():
@@ -22,6 +22,7 @@ def setup_gemini():
         print("❌ 错误: 缺少 GOOGLE_API_KEY")
         return None
     genai.configure(api_key=GOOGLE_API_KEY)
+    # 使用通用别名
     return genai.GenerativeModel('gemini-flash-latest')
 
 def get_latest_papers(topics):
@@ -82,6 +83,7 @@ def main():
     model = setup_gemini()
     if not model: return
     
+    # 关键词设置
     keywords = '(ti:"Alzheimer" OR abs:"Alzheimer") AND (ti:"microglia" OR abs:"microglia")'
     papers = get_latest_papers(keywords)
     
