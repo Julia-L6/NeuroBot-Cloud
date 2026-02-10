@@ -17,6 +17,13 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 raw_password = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECEIVER = "julia_light@msn.cn"
 
+# 🔴 策略调整区
+# 每天只深度分析多少篇？(建议不超过15篇以避免429错误)
+MAX_AI_ANALYSIS_NEURO = 10 
+MAX_AI_ANALYSIS_TCM = 3
+# 检索最近几天？(建议2-3天，避免0结果)
+SEARCH_WINDOW_DAYS = 2 
+
 if raw_password:
     EMAIL_PASSWORD = raw_password.replace(' ', '').replace('\xa0', '').strip()
 else:
@@ -24,68 +31,46 @@ else:
 
 # --- 2. 动态期刊数据库 ---
 def load_journal_db():
-    """读取仓库中的 journals.csv 文件"""
     db = {}
     csv_path = 'journals.csv'
-    
     if not os.path.exists(csv_path):
-        print("⚠️ 未找到 journals.csv，IF 功能将受限")
         return {}
-
     try:
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
-            next(reader, None) # 跳过标题行
+            next(reader, None)
             for row in reader:
                 if len(row) >= 2:
-                    # key: 归一化后的期刊名 (小写, 去空格)
                     name = row[0].lower().strip()
-                    if_val = row[1].strip()
-                    zone = row[2].strip() if len(row) > 2 else "?"
-                    db[name] = {"if": if_val, "q": zone}
-        print(f"📚 已加载 {len(db)} 条期刊数据")
-    except Exception as e:
-        print(f"❌ 读取 CSV 失败: {e}")
+                    db[name] = {"if": row[1].strip(), "q": row[2].strip() if len(row) > 2 else "?"}
+    except:
+        pass
     return db
 
-# 全局加载一次
 JOURNAL_DB = load_journal_db()
 
 def get_journal_metrics(journal_name):
-    """
-    匹配期刊 IF。
-    策略：
-    1. 完全匹配 (忽略大小写)
-    2. 如果匹配不到，返回 N/A，不乱猜
-    """
     if not journal_name: return "N/A", "N/A"
-    
-    # 清洗：Journal of X (London) -> journal of x
     clean_name = journal_name.lower().split('(')[0].strip()
-    
-    # 1. 直接查表
     if clean_name in JOURNAL_DB:
         return JOURNAL_DB[clean_name]['if'], JOURNAL_DB[clean_name]['q']
-    
-    # 2. 尝试移除 "The" (例如 "The Lancet" vs "Lancet")
     if clean_name.startswith("the "):
-        alt_name = clean_name[4:].strip()
-        if alt_name in JOURNAL_DB:
-            return JOURNAL_DB[alt_name]['if'], JOURNAL_DB[alt_name]['q']
-
+        alt = clean_name[4:].strip()
+        if alt in JOURNAL_DB: return JOURNAL_DB[alt]['if'], JOURNAL_DB[alt]['q']
     return "N/A", ""
 
 def setup_gemini():
     if not GOOGLE_API_KEY:
-        print("❌ 错误: 缺少 GOOGLE_API_KEY")
+        print("❌ 无 API KEY")
         return None
     genai.configure(api_key=GOOGLE_API_KEY)
-    return genai.GenerativeModel('gemini-flash-latest')
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 def search_pubmed_ids(query, max_results):
-    print(f"🔍 检索: {query[:50]}... (Max: {max_results})")
+    print(f"🔍 检索(近{SEARCH_WINDOW_DAYS}天): {query[:30]}...")
     try:
-        handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results, sort="date", reldate=7, datetype="pdat")
+        # ✅ 关键修改：reldate 使用配置变量
+        handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results, sort="date", reldate=SEARCH_WINDOW_DAYS, datetype="pdat")
         record = Entrez.read(handle)
         handle.close()
         return record["IdList"]
@@ -95,167 +80,131 @@ def search_pubmed_ids(query, max_results):
 
 def fetch_and_parse(id_list, tag_label):
     if not id_list: return []
-    print(f"📥 [{tag_label}] 下载 {len(id_list)} 篇详情...")
-    
+    print(f"📥 [{tag_label}] 下载 {len(id_list)} 篇...")
     try:
         handle = Entrez.efetch(db="pubmed", id=id_list, rettype="xml", retmode="xml")
         xml_data = Entrez.read(handle)
         handle.close()
-    except Exception as e:
-        print(f"❌ 下载失败: {e}")
+    except:
         return []
 
     parsed_list = []
-    articles = xml_data.get('PubmedArticle', [])
-    
-    for article in articles:
+    for article in xml_data.get('PubmedArticle', []):
         try:
-            medline = article.get('MedlineCitation', {})
-            art = medline.get('Article', {})
-            
+            art = article.get('MedlineCitation', {}).get('Article', {})
             title = art.get('ArticleTitle')
-            if not title: continue 
-
-            abstract_list = art.get('Abstract', {}).get('AbstractText', [])
-            abstract = " ".join(abstract_list) if abstract_list else "【无摘要】"
+            if not title: continue
             
-            journal_info = art.get('Journal', {})
-            journal_name = journal_info.get('Title', 'Unknown')
+            abstract = " ".join(art.get('Abstract', {}).get('AbstractText', [])) or "【无摘要】"
+            j_name = art.get('Journal', {}).get('Title', 'Unknown')
+            if_val, zone = get_journal_metrics(j_name)
             
-            # 获取 IF 和分区
-            if_val, zone = get_journal_metrics(journal_name)
+            try: sort_score = float(if_val)
+            except: sort_score = -1.0
             
-            # 只有当 IF 是数字时才用于排序，否则设为 -1
-            try:
-                sort_score = float(if_val)
-            except:
-                sort_score = -1.0
-
-            pub_date = art.get('ArticleDate', [])
-            date_str = "Recent"
-            if pub_date:
-                date_str = f"{pub_date[0].get('Year')}-{pub_date[0].get('Month')}-{pub_date[0].get('Day')}"
-
+            d = art.get('ArticleDate', [])
+            date_str = f"{d[0]['Year']}-{d[0]['Month']}-{d[0]['Day']}" if d else "Recent"
+            
             authors = art.get('AuthorList', [])
-            first_auth = "Unknown"
+            auth = "Unknown"
             if authors:
                 f = authors[0]
-                aff = ""
-                if f.get('AffiliationInfo'):
-                    aff = f['AffiliationInfo'][0].get('Affiliation', '')
-                flag = ""
-                if "China" in aff: flag = "[🇨🇳China]"
-                elif "USA" in aff: flag = "[🇺🇸USA]"
-                first_auth = f"{f.get('LastName')} {f.get('ForeName')} {flag}"
+                aff = f['AffiliationInfo'][0]['Affiliation'] if f.get('AffiliationInfo') else ""
+                flag = "[🇨🇳CN]" if "China" in aff else ("[🇺🇸US]" if "USA" in aff else "")
+                auth = f"{f.get('LastName')} {flag}"
 
             parsed_list.append({
-                "title": title,
-                "abstract": abstract,
-                "journal": journal_name,
-                "if": if_val,
-                "zone": zone,
-                "sort_score": sort_score, # 专门用于排序的数字
-                "date": date_str,
-                "author": first_auth,
-                "tag": tag_label
+                "title": title, "abstract": abstract, "journal": j_name,
+                "if": if_val, "zone": zone, "sort_score": sort_score,
+                "date": date_str, "author": auth, "tag": tag_label
             })
-            
-        except Exception as e:
-            continue
-
+        except: continue
     return parsed_list
 
 def analyze_with_ai(model, paper):
-    print(f"🤖 AI 阅读: {paper['title'][:30]}...")
-    
-    # 构造 IF 显示字符串
-    if_str = paper['if']
-    if paper['zone']:
-        if_str += f" ({paper['zone']})"
+    print(f"🤖 AI 阅读: {paper['title'][:20]}...")
     
     prompt = f"""
-    你是一位资深神经科学研究员。请简要分析这篇文献。
-    
+    你是神经科学专家。请用中文简述这篇文献。
     标题: {paper['title']}
     摘要: {paper['abstract']}
     
-    请严格按Markdown格式输出:
+    输出格式(Markdown):
     ### {paper['tag']} | {paper['title']}
-    > 📅 {paper['date']} | 📖 {paper['journal']} | 📊 IF: {if_str} | 👤 {paper['author']}
-    
-    - **🏷️ 类型**: [综述/动物/细胞/临床/数据]
-    - **🧐 核心**: (简要总结，关注定量数据)
-    - **🔬 机制**: (关键分子/通路/药味)
-    ---
+    > 📅 {paper['date']} | 📖 {paper['journal']} (IF:{paper['if']}) | 👤 {paper['author']}
+    - **🏷️ 类型**: [综述/实验/临床]
+    - **🧐 核心**: (一句话结论,含数据)
+    - **🔬 机制**: (通路/靶点)
     """
     
-    for _ in range(3):
+    # ✅ 关键修改：更稳健的重试逻辑
+    for attempt in range(3):
         try:
             res = model.generate_content(prompt)
+            # 成功后，强制休息 15 秒 (避免RPM超限)
+            time.sleep(15) 
             return res.text.replace('\xa0', ' ')
-        except:
-            time.sleep(5)
-    return ""
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str:
+                print(f"⚠️ 触发限流 (429)，冷却 60秒...")
+                time.sleep(60) # 罚站 60s
+            else:
+                print(f"⚠️ 其他错误: {e}")
+                time.sleep(5)
+    
+    return f"❌ {paper['title']} (分析失败)\n\n"
 
-def send_email(subject, content):
-    if not EMAIL_PASSWORD:
-        return
-    
-    msg = MIMEText(content, 'plain', 'utf-8')
-    msg['From'] = EMAIL_SENDER
-    msg['To'] = EMAIL_RECEIVER
-    msg['Subject'] = Header(subject, 'utf-8')
-    
-    try:
-        s = smtplib.SMTP(SMTP_SERVER, int(SMTP_PORT))
-        s.starttls()
-        s.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        s.sendmail(EMAIL_SENDER, [EMAIL_RECEIVER], msg.as_string())
-        s.quit()
-        print("✅ 邮件发送成功")
-    except Exception as e:
-        print(f"❌ 发送失败: {e}")
+def format_simple_list(papers):
+    """不经过AI，只列出标题，节省额度"""
+    if not papers: return ""
+    txt = "\n#### 📋 其他新收录文献 (仅列表)\n"
+    for p in papers:
+        txt += f"- **{p['date']}** | {p['title']} | *{p['journal']}*\n"
+    return txt + "\n"
 
 def main():
     model = setup_gemini()
-    if not model: return
-
-    # 1. Neuro 通道
-    q_neuro = '(Alzheimer\'s disease[Title/Abstract] AND (microglia[Title/Abstract] OR neuroinflammation[Title/Abstract]))'
-    # 抓取 40 篇，增加筛选池
-    neuro_raw = fetch_and_parse(search_pubmed_ids(q_neuro, 40), "🧠Neuro")
     
-    # 排序：优先按 IF 分数高低，Unknown 的排后面
-    neuro_raw.sort(key=lambda x: x['sort_score'], reverse=True)
-    final_neuro = neuro_raw[:20]
-
-    # 2. TCM 通道
-    q_tcm = '((Traditional Chinese Medicine[Title/Abstract] OR Herbal[Title/Abstract] OR Acupuncture[Title/Abstract]) AND (Alzheimer[Title/Abstract] OR Brain[Title/Abstract]))'
-    tcm_raw = fetch_and_parse(search_pubmed_ids(q_tcm, 15), "🌿TCM")
+    # Neuro
+    neuro_ids = search_pubmed_ids('(Alzheimer\'s disease[Title/Abstract] AND (microglia[Title/Abstract] OR neuroinflammation[Title/Abstract]))', 30)
+    neuro_papers = fetch_and_parse(neuro_ids, "🧠")
+    neuro_papers.sort(key=lambda x: x['sort_score'], reverse=True)
     
-    tcm_raw.sort(key=lambda x: x['sort_score'], reverse=True)
-    final_tcm = tcm_raw[:5]
+    # TCM
+    tcm_ids = search_pubmed_ids('((Traditional Chinese Medicine[Title/Abstract] OR Herbal[Title/Abstract] OR Acupuncture[Title/Abstract]) AND (Alzheimer[Title/Abstract] OR Brain[Title/Abstract]))', 10)
+    tcm_papers = fetch_and_parse(tcm_ids, "🌿")
+    tcm_papers.sort(key=lambda x: x['sort_score'], reverse=True)
 
-    total = len(final_neuro) + len(final_tcm)
-    if total == 0:
-        print("📭 无数据")
+    if not neuro_papers and not tcm_papers:
+        print("📭 今日无数据")
         return
 
+    # === 分级处理 ===
+    # 1. 精选 (AI分析)
+    top_neuro = neuro_papers[:MAX_AI_ANALYSIS_NEURO]
+    top_tcm = tcm_papers[:MAX_AI_ANALYSIS_TCM]
+    
+    # 2. 列表 (仅标题)
+    rest_neuro = neuro_papers[MAX_AI_ANALYSIS_NEURO:]
+    rest_tcm = tcm_papers[MAX_AI_ANALYSIS_TCM:]
+
     content = f"🧠 NeuroBot 日报 ({datetime.date.today()})\n"
-    content += f"📚 IF数据源: 本地数据库 (匹配失败显示 N/A)\n\n"
+    content += f"⏱️ 检索范围: 过去 {SEARCH_WINDOW_DAYS} 天 | 📊 收录: {len(neuro_papers)+len(tcm_papers)} 篇\n\n"
 
-    if final_tcm:
-        content += "--- 🌿 TCM 特别关注 ---\n\n"
-        for p in final_tcm:
-            content += analyze_with_ai(model, p)
-            time.sleep(3)
+    # TCM 板块
+    if top_tcm:
+        content += "--- 🌿 TCM 精选 ---\n\n"
+        for p in top_tcm: content += analyze_with_ai(model, p)
+        content += format_simple_list(rest_tcm)
 
-    content += "\n--- 🧠 神经科学核心推荐 ---\n\n"
-    for p in final_neuro:
-        content += analyze_with_ai(model, p)
-        time.sleep(3)
+    # Neuro 板块
+    if top_neuro:
+        content += "\n--- 🧠 Neuro 精选 ---\n\n"
+        for p in top_neuro: content += analyze_with_ai(model, p)
+        content += format_simple_list(rest_neuro)
 
-    send_email(f"NeuroBot日报 ({total}篇) - {datetime.date.today()}", content)
+    send_email(f"NeuroBot日报 - {datetime.date.today()}", content)
 
 if __name__ == "__main__":
     main()
