@@ -17,11 +17,9 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 raw_password = os.getenv("EMAIL_PASSWORD")
 EMAIL_RECEIVER = "julia_light@msn.cn"
 
-# 🔴 策略调整区
-# 每天只深度分析多少篇？(建议不超过15篇以避免429错误)
+# 策略配置
 MAX_AI_ANALYSIS_NEURO = 10 
 MAX_AI_ANALYSIS_TCM = 3
-# 检索最近几天？(建议2-3天，避免0结果)
 SEARCH_WINDOW_DAYS = 2 
 
 if raw_password:
@@ -64,12 +62,13 @@ def setup_gemini():
         print("❌ 无 API KEY")
         return None
     genai.configure(api_key=GOOGLE_API_KEY)
+    
+    # ✅ 已按要求修改为 'gemini-flash-latest'
     return genai.GenerativeModel('gemini-flash-latest')
 
 def search_pubmed_ids(query, max_results):
     print(f"🔍 检索(近{SEARCH_WINDOW_DAYS}天): {query[:30]}...")
     try:
-        # ✅ 关键修改：reldate 使用配置变量
         handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results, sort="date", reldate=SEARCH_WINDOW_DAYS, datetype="pdat")
         record = Entrez.read(handle)
         handle.close()
@@ -137,26 +136,47 @@ def analyze_with_ai(model, paper):
     - **🔬 机制**: (通路/靶点)
     """
     
-    # ✅ 关键修改：更稳健的重试逻辑
     for attempt in range(3):
         try:
             res = model.generate_content(prompt)
-            # 成功后，强制休息 15 秒 (避免RPM超限)
+            # 成功后休息15秒避免限流
             time.sleep(15) 
             return res.text.replace('\xa0', ' ')
         except Exception as e:
             err_str = str(e)
             if "429" in err_str:
                 print(f"⚠️ 触发限流 (429)，冷却 60秒...")
-                time.sleep(60) # 罚站 60s
+                time.sleep(60) 
+            elif "404" in err_str:
+                return f"❌ 模型名称错误或不支持: {paper['title']}\n\n"
             else:
                 print(f"⚠️ 其他错误: {e}")
                 time.sleep(5)
     
     return f"❌ {paper['title']} (分析失败)\n\n"
 
+# ✅ 补全了之前丢失的 send_email 函数
+def send_email(subject, content):
+    if not EMAIL_PASSWORD:
+        print("❌ 邮箱密码未设置")
+        return
+    
+    msg = MIMEText(content, 'plain', 'utf-8')
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = EMAIL_RECEIVER
+    msg['Subject'] = Header(subject, 'utf-8')
+    
+    try:
+        s = smtplib.SMTP(SMTP_SERVER, int(SMTP_PORT))
+        s.starttls()
+        s.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        s.sendmail(EMAIL_SENDER, [EMAIL_RECEIVER], msg.as_string())
+        s.quit()
+        print(f"✅ 邮件发送成功 (长度: {len(content)})")
+    except Exception as e:
+        print(f"❌ 发送失败: {e}")
+
 def format_simple_list(papers):
-    """不经过AI，只列出标题，节省额度"""
     if not papers: return ""
     txt = "\n#### 📋 其他新收录文献 (仅列表)\n"
     for p in papers:
@@ -166,12 +186,10 @@ def format_simple_list(papers):
 def main():
     model = setup_gemini()
     
-    # Neuro
     neuro_ids = search_pubmed_ids('(Alzheimer\'s disease[Title/Abstract] AND (microglia[Title/Abstract] OR neuroinflammation[Title/Abstract]))', 30)
     neuro_papers = fetch_and_parse(neuro_ids, "🧠")
     neuro_papers.sort(key=lambda x: x['sort_score'], reverse=True)
     
-    # TCM
     tcm_ids = search_pubmed_ids('((Traditional Chinese Medicine[Title/Abstract] OR Herbal[Title/Abstract] OR Acupuncture[Title/Abstract]) AND (Alzheimer[Title/Abstract] OR Brain[Title/Abstract]))', 10)
     tcm_papers = fetch_and_parse(tcm_ids, "🌿")
     tcm_papers.sort(key=lambda x: x['sort_score'], reverse=True)
@@ -180,25 +198,19 @@ def main():
         print("📭 今日无数据")
         return
 
-    # === 分级处理 ===
-    # 1. 精选 (AI分析)
     top_neuro = neuro_papers[:MAX_AI_ANALYSIS_NEURO]
     top_tcm = tcm_papers[:MAX_AI_ANALYSIS_TCM]
-    
-    # 2. 列表 (仅标题)
     rest_neuro = neuro_papers[MAX_AI_ANALYSIS_NEURO:]
     rest_tcm = tcm_papers[MAX_AI_ANALYSIS_TCM:]
 
     content = f"🧠 NeuroBot 日报 ({datetime.date.today()})\n"
     content += f"⏱️ 检索范围: 过去 {SEARCH_WINDOW_DAYS} 天 | 📊 收录: {len(neuro_papers)+len(tcm_papers)} 篇\n\n"
 
-    # TCM 板块
     if top_tcm:
         content += "--- 🌿 TCM 精选 ---\n\n"
         for p in top_tcm: content += analyze_with_ai(model, p)
         content += format_simple_list(rest_tcm)
 
-    # Neuro 板块
     if top_neuro:
         content += "\n--- 🧠 Neuro 精选 ---\n\n"
         for p in top_neuro: content += analyze_with_ai(model, p)
