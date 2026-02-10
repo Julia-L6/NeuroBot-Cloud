@@ -5,6 +5,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 import google.generativeai as genai
+import arxiv # 导入整个 arxiv 库
 from arxiv import Search, SortCriterion
 
 # --- 1. 获取密钥 ---
@@ -26,13 +27,35 @@ def setup_gemini():
 
 def get_latest_papers(topics):
     print(f"🔍 正在检索: {topics}")
-    # 注意：arxiv 库旧版写法，虽有警告但能用，暂保持稳定
+    
+    # ✅ 改进点1：配置 ArXiv 客户端，设置延迟和重试
+    client = arxiv.Client(
+        page_size=3,
+        delay_seconds=10.0, # 每次请求强制间隔10秒，对服务器更友好
+        num_retries=5       # 库内部自动重试5次
+    )
+
     search = Search(
         query=topics,
         max_results=3, 
         sort_by=SortCriterion.SubmittedDate
     )
-    return list(search.results())
+    
+    # ✅ 改进点2：外层手动重试循环，专门对抗 429 错误
+    for attempt in range(3): # 给它3次“死里复活”的机会
+        try:
+            # 使用新版写法 client.results
+            return list(client.results(search))
+        except Exception as e:
+            print(f"⚠️ 检索遭遇拥堵 (尝试 {attempt+1}/3): {e}")
+            if "429" in str(e):
+                print("⏳ 触发 ArXiv 限流，强制休眠 30 秒...")
+                time.sleep(30) # 休息30秒再试
+            else:
+                time.sleep(5)
+    
+    print("❌ 三次尝试均失败，今日跳过检索。")
+    return []
 
 def analyze_paper(model, paper):
     print(f"🤖 正在阅读: {paper.title}")
@@ -54,7 +77,7 @@ def analyze_paper(model, paper):
     for _ in range(3):
         try:
             response = model.generate_content(prompt)
-            # ✅ 关键修复：强制替换掉导致报错的特殊字符 \xa0
+            # 清洗特殊字符
             safe_text = response.text.replace('\xa0', ' ')
             return safe_text
         except Exception as e:
@@ -67,7 +90,6 @@ def send_email(subject, content):
         print("⚠️ 邮箱配置缺失")
         return
     
-    # ✅ 关键修复：再次清洗全文，确保万无一失
     content = content.replace('\xa0', ' ')
     
     msg = MIMEText(content, 'plain', 'utf-8')
@@ -83,7 +105,6 @@ def send_email(subject, content):
         server.quit()
         print(f"✅ 邮件已成功发送至 {EMAIL_RECEIVER}")
     except Exception as e:
-        # 这里使用 repr() 可以把错误编码显示出来，方便调试
         print(f"❌ 发送失败: {repr(e)}")
 
 def main():
@@ -94,7 +115,8 @@ def main():
     papers = get_latest_papers(keywords)
     
     if not papers:
-        send_email("NeuroBot: 今日无新论文", "未检索到符合条件的新论文。")
+        # 如果是因为网络拥堵没拿到论文，发个邮件通知一下，而不是报错
+        print("📭 本次运行未获取到论文 (可能是无新文，也可能是网络拥堵)")
         return
 
     content = f"🧠 NeuroBot 日报 ({datetime.date.today()})\n\n"
