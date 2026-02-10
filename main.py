@@ -64,7 +64,7 @@ def setup_gemini():
         print("❌ 无 API KEY")
         return None
     genai.configure(api_key=GOOGLE_API_KEY)
-    return genai.GenerativeModel('gemini-1.5-flash')
+    return genai.GenerativeModel('gemini-flash-latest')
 
 def search_pubmed_ids(query, max_results):
     print(f"🔍 检索(近{SEARCH_WINDOW_DAYS}天): {query[:30]}...")
