@@ -20,7 +20,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install google-generativeai biopython
 
       - name: Run NeuroBot
         env:
