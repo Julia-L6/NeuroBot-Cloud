@@ -149,10 +149,24 @@ def search_and_fetch_all():
                     journal = art.get('Journal', {}).get('Title', 'Unknown')
                     if_val, zone, is_high_impact = get_journal_metrics(journal)
                     
-                    # 日期处理
-                    d = art.get('ArticleDate', [])
-                    date_str = f"{d[0]['Year']}-{d[0]['Month']}-{d[0]['Day']}" if d else "Recent"
-                    pub_status = "Online" if d else "Print"
+                    # 日期处理：区分 Online 和 Print
+                    # 1. 获取 Online Date
+                    ad = art.get('ArticleDate', [])
+                    if ad:
+                        online_date = f"{ad[0]['Year']}-{ad[0]['Month']}-{ad[0]['Day']}"
+                    else:
+                        online_date = "[N/A]"
+
+                    # 2. 获取 Print Date
+                    pd = art.get('Journal', {}).get('JournalIssue', {}).get('PubDate', {})
+                    if 'Year' in pd:
+                        print_date = pd['Year']
+                        if 'Month' in pd: print_date += f"-{pd['Month']}"
+                        if 'Day' in pd: print_date += f"-{pd['Day']}"
+                    elif 'MedlineDate' in pd:
+                        print_date = pd['MedlineDate'] # 处理类似 "2023 Oct-Dec" 的格式
+                    else:
+                        print_date = "[N/A]"
                     
                     # 作者处理
                     authors = art.get('AuthorList', [])
@@ -184,8 +198,8 @@ def search_and_fetch_all():
                         "Title": title,
                         "Journal": journal,
                         "IF": if_val,
-                        "Date": date_str,
-                        "Status": pub_status,
+                        "Online_Date": online_date,
+                        "Print_Date": print_date,
                         "Type": type_str,
                         "First_Author": first_auth,
                         "Senior_Author": senior_auth,
@@ -244,7 +258,8 @@ def analyze_with_gemini(papers):
 筛选标准：高分期刊 (IF>10) 或 机制创新极强（如发现新靶点/新通路）的研究。
 请对每一篇重点文献按以下格式进行深读：
 
-- **标题**：(中文翻译)
+- **标题**：(中文翻译) (原文标题，保留 CSV Title 列内容)
+- **PMID**：(保留 CSV PMID 列内容)
 - **期刊/IF**：(保留原名)
 - **👥 关键作者**：
   - 一作：(提取自 CSV First Author 列，保留姓名、机构、国家)
@@ -261,9 +276,9 @@ def analyze_with_gemini(papers):
 筛选标准：验证性研究、低分期刊或纯临床统计文章。
 **请务必以表格形式展示，不要分段描述：**
 
-| 序号 | 标题 (中文) | 期刊 | 类型 | 核心发现 (一句话) |
-| :--- | :--- | :--- | :--- | :--- |
-| 1 | ... | ... | ... | ... |
+| 序号 | 标题 (中文) | 期刊 | 类型 | 核心发现 (一句话) | PMID |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | ... | ... | ... | ... | ... |
 
 # Input Data
 {csv_block}
@@ -317,7 +332,7 @@ def main():
 
     # 2. 生成 CSV
     csv_name = f"NeuroBot_Data_{datetime.date.today()}.csv"
-    headers = ["PMID", "Title", "Journal", "IF", "Date", "Status", "Type", "First_Author", "Senior_Author", "DOI", "Abstract", "Score"]
+    headers = ["PMID", "Title", "Journal", "IF", "Online_Date", "Print_Date", "Type", "First_Author", "Senior_Author", "DOI", "Abstract", "Score"]
     with open(csv_name, 'w', newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
